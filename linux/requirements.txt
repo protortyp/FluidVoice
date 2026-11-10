@@ -1,0 +1,10 @@
+onnx-asr[hub]
+onnxruntime-gpu
+numpy
+pynput
+nvidia-cudnn-cu13
+nvidia-cublas
+nvidia-cuda-runtime
+nvidia-cufft
+nvidia-curand
+nvidia-cuda-nvrtc
