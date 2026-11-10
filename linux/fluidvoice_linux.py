@@ -194,6 +194,10 @@ class Recorder:
             self._chunks.append(chunk)
             self._on_level(float(np.sqrt(np.mean(chunk**2))) if chunk.size else 0.0)
 
+    def snapshot(self) -> np.ndarray:
+        chunks = list(self._chunks)  # the reader thread keeps appending
+        return np.concatenate(chunks) if chunks else np.zeros(0, np.float32)
+
     def stop(self) -> np.ndarray:
         proc, self._proc = self._proc, None
         if proc:
@@ -205,17 +209,20 @@ class Recorder:
 
 
 class Overlay(Gtk.Window):
-    """Small always-on-top pill at the bottom centre that never takes focus.
+    """Always-on-top pill at the bottom centre showing the live transcript; never takes focus.
 
     Built from stock widgets and CSS: custom cairo drawing needs python3-gi-cairo,
     which is not installed everywhere.
     """
 
-    BARS = 20
+    WIDTH = 580
+    MAX_CHARS = 110  # what fits on the two visible lines
     CSS = b"""
-    .pill { background-color: rgba(20, 20, 26, 0.92); border-radius: 28px; padding: 0 22px; }
-    .pill label { color: #9fcfff; font-size: 15px; }
-    .bar { background-color: #ff5959; border-radius: 3px; min-width: 5px; }
+    .pill { background-color: rgba(20, 20, 26, 0.94); border-radius: 22px; padding: 0 22px; }
+    .pill label { color: #f2f2f5; font-size: 15px; }
+    .pill label.dim { color: #8d8d99; }
+    .dot { background-color: #ff5959; border-radius: 11px; }
+    .dot.busy { background-color: #6cb4ff; }
     """
 
     def __init__(self) -> None:
@@ -225,7 +232,7 @@ class Overlay(Gtk.Window):
         self.set_keep_above(True)
         self.set_skip_taskbar_hint(True)
         self.set_app_paintable(True)
-        self.set_default_size(260, 56)
+        self.set_default_size(self.WIDTH, 76)
         visual = self.get_screen().get_rgba_visual()
         if visual:
             self.set_visual(visual)
@@ -236,22 +243,25 @@ class Overlay(Gtk.Window):
             self.get_screen(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
         )
 
-        self._levels = [0.0] * self.BARS
-        self._bars: list[Gtk.Box] = []
-        self._bar_row = Gtk.Box(spacing=4, halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER)
-        for _ in range(self.BARS):
-            bar = Gtk.Box(valign=Gtk.Align.CENTER)
-            bar.get_style_context().add_class("bar")
-            bar.set_size_request(5, 4)
-            self._bar_row.pack_start(bar, False, False, 0)
-            self._bars.append(bar)
-        self._label = Gtk.Label()
+        # The dot swells with the mic level.
+        self._dot = Gtk.Box(halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER)
+        self._dot.get_style_context().add_class("dot")
+        self._dot.set_size_request(10, 10)
+        dot_slot = Gtk.Box()
+        dot_slot.set_size_request(22, 22)
+        dot_slot.set_center_widget(self._dot)
 
-        self._stack = Gtk.Stack()
-        self._stack.add_named(self._bar_row, "recording")
-        self._stack.add_named(self._label, "text")
-        self._stack.get_style_context().add_class("pill")
-        self.add(self._stack)
+        self._label = Gtk.Label(xalign=0, yalign=0.5)
+        self._label.set_line_wrap(True)
+        self._label.set_lines(2)
+        self._label.set_ellipsize(3)  # Pango.EllipsizeMode.END
+        self._label.set_size_request(self.WIDTH - 110, 44)
+
+        row = Gtk.Box(spacing=16, valign=Gtk.Align.CENTER)
+        row.pack_start(dot_slot, False, False, 0)
+        row.pack_start(self._label, True, True, 0)
+        row.get_style_context().add_class("pill")
+        self.add(row)
 
     def _place(self) -> None:
         display = Gdk.Display.get_default()
@@ -260,38 +270,47 @@ class Overlay(Gtk.Window):
         w, h = self.get_size()
         self.move(geo.x + (geo.width - w) // 2, geo.y + geo.height - h - 80)
 
-    def show_state(self, status: str) -> None:
-        if status == "recording":
-            self._levels = [0.0] * self.BARS
-            self._refresh_bars()
-            self._stack.set_visible_child_name("recording")
-        else:
-            self._label.set_text(status)
-            self._stack.set_visible_child_name("text")
+    def show_state(self, status: str, busy: bool = False) -> None:
+        """Show a placeholder message (dimmed); the dot turns blue while busy."""
+        self._set_label(status, dim=True)
+        ctx = self._dot.get_style_context()
+        (ctx.add_class if busy else ctx.remove_class)("busy")
+        self._dot.set_size_request(10, 10)
         if not self.get_visible():
             self.show_all()
             self._place()
 
-    def push_level(self, rms: float) -> None:
-        self._levels = self._levels[1:] + [min(1.0, rms * 12)]
-        self._refresh_bars()
+    def set_transcript(self, text: str) -> None:
+        if text:
+            if len(text) > self.MAX_CHARS:
+                text = "…" + text[-self.MAX_CHARS:].split(" ", 1)[-1]
+            self._set_label(text, dim=False)
 
-    def _refresh_bars(self) -> None:
-        for bar, level in zip(self._bars, self._levels):
-            bar.set_size_request(5, max(4, int(level * 38)))
+    def _set_label(self, text: str, dim: bool) -> None:
+        self._label.set_text(text)
+        ctx = self._label.get_style_context()
+        (ctx.add_class if dim else ctx.remove_class)("dim")
+
+    def push_level(self, rms: float) -> None:
+        size = 10 + int(min(1.0, rms * 12) * 12)
+        self._dot.set_size_request(size, size)
 
 
 class App:
+    LIVE_POLL_S = 0.15
+    LIVE_MIN_SECONDS = 0.5
+
     def __init__(self) -> None:
         self.overlay = Overlay()
         self.recorder = Recorder(lambda rms: GLib.idle_add(self.overlay.push_level, rms))
         self.bluetooth = BluetoothMic()
         self.model = None
-        self.holding = False  # AltGr is down
-        self.recording = False  # the recorder is running
-        self.cancelled = False
-        self.busy = False
-        self._generation = 0  # invalidates a mic start that outlived its key press
+        # idle -> starting (mic coming up) -> recording -> processing -> idle
+        self.state = "idle"
+        self._altgr_down = False
+        self._altgr_tainted = False  # another key was pressed during this AltGr hold
+        self._generation = 0  # invalidates work that outlived its dictation session
+        self._model_lock = threading.Lock()  # the live and final passes share one session
 
     def load_model(self) -> None:
         import onnx_asr
@@ -306,28 +325,43 @@ class App:
         print(f"loading {MODEL} on {providers[0]} ...", flush=True)
         path = snapshot_download(MODEL_REPO, local_dir=MODEL_DIR)
         self.model = onnx_asr.load_model(MODEL, path, providers=providers)
-        self.model.recognize(np.zeros(SAMPLE_RATE, np.float32), sample_rate=SAMPLE_RATE)
-        print("ready: hold AltGr to dictate", flush=True)
+        self._recognize(np.zeros(SAMPLE_RATE, np.float32))
+        print("ready: tap AltGr to start dictating, tap again to paste", flush=True)
+
+    def _recognize(self, audio: np.ndarray) -> str:
+        with self._model_lock:
+            return str(self.model.recognize(audio, sample_rate=SAMPLE_RATE)).strip()
 
     def on_press(self, key) -> None:
         if is_altgr(key):
-            if not self.holding and not self.busy and self.model:
-                GLib.idle_add(self.begin)
-        elif self.holding:
-            # AltGr is also a character modifier (e.g. AltGr+q = @): that is typing, not dictation.
-            self.cancelled = True
+            self._altgr_down = True
+            self._altgr_tainted = False
+        elif self._altgr_down:
+            # AltGr is also a character modifier (e.g. AltGr+q = @): that is typing, not a tap.
+            self._altgr_tainted = True
+        elif key == keyboard.Key.esc and self.state in ("starting", "recording"):
+            GLib.idle_add(self.cancel)
 
     def on_release(self, key) -> None:
-        if is_altgr(key) and self.holding:
-            GLib.idle_add(self.finish)
+        if is_altgr(key) and self._altgr_down:
+            self._altgr_down = False
+            if not self._altgr_tainted:
+                GLib.idle_add(self.toggle)
 
-    def begin(self) -> bool:
-        self.holding = True
-        self.cancelled = False
+    def toggle(self) -> bool:
+        if self.state == "idle" and self.model:
+            self.begin()
+        elif self.state == "recording":
+            self.finish()
+        elif self.state == "starting":
+            self.cancel()
+        return False
+
+    def begin(self) -> None:
+        self.state = "starting"
         self._generation += 1
         self.overlay.show_state("starting mic...")
         threading.Thread(target=self._prepare_mic, args=(self._generation,), daemon=True).start()
-        return False
 
     def _prepare_mic(self, generation: int) -> None:
         if not self.bluetooth.acquire():
@@ -335,39 +369,64 @@ class App:
         GLib.idle_add(self._mic_ready, generation)
 
     def _mic_ready(self, generation: int) -> bool:
-        if generation != self._generation or not self.holding:
-            return False  # released before the mic came up; finish() already cleaned up
-        self.recording = True
-        self.overlay.show_state("recording")
+        if generation != self._generation or self.state != "starting":
+            return False  # cancelled while the mic was coming up
+        self.state = "recording"
+        self.overlay.show_state("Listening...")
         self.recorder.start()
+        threading.Thread(target=self._live_loop, args=(generation,), daemon=True).start()
         return False
 
-    def finish(self) -> bool:
-        self.holding = False
-        if not self.recording:
-            self.overlay.hide()
-            self.bluetooth.release_later()
-            return False
-        self.recording = False
+    def _live_loop(self, generation: int) -> None:
+        """Re-transcribes the audio so far, so the overlay follows the speech.
+
+        Parakeet TDT is an offline model; on a GPU a full pass over the buffer is fast
+        enough to run continuously and always yields the best transcript of everything said.
+        """
+        seen = 0
+        while self.state == "recording" and generation == self._generation:
+            audio = self.recorder.snapshot()
+            if audio.size < self.LIVE_MIN_SECONDS * SAMPLE_RATE or audio.size == seen:
+                time.sleep(self.LIVE_POLL_S)
+                continue
+            seen = audio.size
+            try:
+                text = self._recognize(audio)
+            except Exception as exc:
+                print(f"live transcription failed: {exc}", file=sys.stderr, flush=True)
+                return
+            if self.state == "recording" and generation == self._generation:
+                GLib.idle_add(self.overlay.set_transcript, text)
+
+    def cancel(self) -> bool:
+        if self.state == "recording":
+            self.recorder.stop()
+        self._generation += 1
+        self.state = "idle"
+        self.overlay.hide()
+        self.bluetooth.release_later()
+        return False
+
+    def finish(self) -> None:
         audio = self.recorder.stop()
         self.bluetooth.release_later()
-        if self.cancelled or audio.size < MIN_SECONDS * SAMPLE_RATE:
-            self.overlay.hide()
-            return False
-        self.busy = True
-        self.overlay.show_state("transcribing...")
+        if audio.size < MIN_SECONDS * SAMPLE_RATE:
+            self.cancel()
+            return
+        self._generation += 1  # stops the live loop
+        self.state = "processing"
+        self.overlay.show_state("Finishing...", busy=True)
         threading.Thread(target=self._transcribe, args=(audio,), daemon=True).start()
-        return False
 
     def _transcribe(self, audio: np.ndarray) -> None:
         try:
-            text = str(self.model.recognize(audio, sample_rate=SAMPLE_RATE)).strip()
+            text = self._recognize(audio)
             if text:
                 paste(text)
         except Exception as exc:  # keep the daemon alive across a bad utterance
             print(f"transcription failed: {exc}", file=sys.stderr, flush=True)
         finally:
-            self.busy = False
+            self.state = "idle"
             GLib.idle_add(self.overlay.hide)
 
 
