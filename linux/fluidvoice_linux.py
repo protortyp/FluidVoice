@@ -72,7 +72,7 @@ SAMPLE_RATE = 16000
 CHUNK_SAMPLES = 1600  # 100 ms
 MIN_SECONDS = 0.3
 TERMINAL_CLASSES = {
-    "gnome-terminal-server", "kitty", "alacritty", "xterm", "konsole",
+    "gnome-terminal", "gnome-terminal-server", "kitty", "alacritty", "xterm", "konsole",
     "terminator", "tilix", "wezterm", "foot", "ghostty", "xfce4-terminal",
 }
 
